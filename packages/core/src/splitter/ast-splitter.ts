@@ -11,6 +11,7 @@ const Go = require('tree-sitter-go');
 const Rust = require('tree-sitter-rust');
 const CSharp = require('tree-sitter-c-sharp');
 const Scala = require('tree-sitter-scala');
+const Lua = require('tree-sitter-lua');
 
 // Node types that represent logical code units
 const SPLITTABLE_NODE_TYPES = {
@@ -22,7 +23,15 @@ const SPLITTABLE_NODE_TYPES = {
     go: ['function_declaration', 'method_declaration', 'type_declaration', 'var_declaration', 'const_declaration'],
     rust: ['function_item', 'impl_item', 'struct_item', 'enum_item', 'trait_item', 'mod_item'],
     csharp: ['method_declaration', 'class_declaration', 'interface_declaration', 'struct_declaration', 'enum_declaration'],
-    scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration']
+    scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration'],
+    // Lua AST 节点类型 (基于 tree-sitter-lua 语法)
+    // function_declaration: function name() end (全局函数)
+    // function_definition: local f = function() end (匿名函数赋值)
+    // local_function: local function name() end (局部函数)
+    // function_call: 函数调用 (用于捕获 DefClass 等类定义模式)
+    // assignment_statement: 赋值语句 (用于捕获 M.xxx = function() 模式)
+    // variable_declaration: 变量声明
+    lua: ['function_declaration', 'function_definition', 'local_function', 'assignment_statement', 'variable_declaration']
 };
 
 export class AstCodeSplitter implements Splitter {
@@ -100,7 +109,8 @@ export class AstCodeSplitter implements Splitter {
             'rs': { parser: Rust, nodeTypes: SPLITTABLE_NODE_TYPES.rust },
             'cs': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
             'csharp': { parser: CSharp, nodeTypes: SPLITTABLE_NODE_TYPES.csharp },
-            'scala': { parser: Scala, nodeTypes: SPLITTABLE_NODE_TYPES.scala }
+            'scala': { parser: Scala, nodeTypes: SPLITTABLE_NODE_TYPES.scala },
+            'lua': { parser: Lua, nodeTypes: SPLITTABLE_NODE_TYPES.lua }
         };
 
         return langMap[language.toLowerCase()] || null;
@@ -118,13 +128,29 @@ export class AstCodeSplitter implements Splitter {
 
         const traverse = (currentNode: Parser.SyntaxNode) => {
             // Check if this node type should be split into a chunk
-            if (splittableTypes.includes(currentNode.type)) {
+            let shouldSplit = splittableTypes.includes(currentNode.type);
+            
+            // Lua-specific: Only split assignment_statement if it contains a function
+            if (language === 'lua' && currentNode.type === 'assignment_statement') {
+                shouldSplit = this.luaAssignmentContainsFunction(currentNode);
+            }
+            
+            // Lua-specific: Only split variable_declaration if it contains a function
+            if (language === 'lua' && currentNode.type === 'variable_declaration') {
+                shouldSplit = this.luaVariableContainsFunction(currentNode);
+            }
+
+            if (shouldSplit) {
                 const startLine = currentNode.startPosition.row + 1;
                 const endLine = currentNode.endPosition.row + 1;
                 const nodeText = code.slice(currentNode.startIndex, currentNode.endIndex);
 
-                // Only create chunk if it has meaningful content
-                if (nodeText.trim().length > 0) {
+                // Only create chunk if it has meaningful content (more than just a simple assignment)
+                // For Lua, require at least 3 lines to be considered a meaningful chunk
+                const lineCount = endLine - startLine + 1;
+                const minLines = language === 'lua' ? 3 : 1;
+                
+                if (nodeText.trim().length > 0 && lineCount >= minLines) {
                     chunks.push({
                         content: nodeText,
                         metadata: {
@@ -134,6 +160,8 @@ export class AstCodeSplitter implements Splitter {
                             filePath,
                         }
                     });
+                    // Don't traverse children of matched nodes to avoid duplicate chunks
+                    return;
                 }
             }
 
@@ -159,6 +187,40 @@ export class AstCodeSplitter implements Splitter {
         }
 
         return chunks;
+    }
+
+    /**
+     * Check if a Lua assignment_statement contains a function definition
+     * e.g., M.method = function() ... end or M:method() ... end
+     */
+    private luaAssignmentContainsFunction(node: Parser.SyntaxNode): boolean {
+        const findFunction = (n: Parser.SyntaxNode): boolean => {
+            if (n.type === 'function_definition' || n.type === 'function_declaration') {
+                return true;
+            }
+            for (const child of n.children) {
+                if (findFunction(child)) return true;
+            }
+            return false;
+        };
+        return findFunction(node);
+    }
+
+    /**
+     * Check if a Lua variable_declaration contains a function definition
+     * e.g., local f = function() ... end
+     */
+    private luaVariableContainsFunction(node: Parser.SyntaxNode): boolean {
+        const findFunction = (n: Parser.SyntaxNode): boolean => {
+            if (n.type === 'function_definition' || n.type === 'function_declaration') {
+                return true;
+            }
+            for (const child of n.children) {
+                if (findFunction(child)) return true;
+            }
+            return false;
+        };
+        return findFunction(node);
     }
 
     private async refineChunks(chunks: CodeChunk[], originalCode: string): Promise<CodeChunk[]> {
@@ -263,7 +325,8 @@ export class AstCodeSplitter implements Splitter {
     static isLanguageSupported(language: string): boolean {
         const supportedLanguages = [
             'javascript', 'js', 'typescript', 'ts', 'python', 'py',
-            'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala'
+            'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala',
+            'lua'
         ];
         return supportedLanguages.includes(language.toLowerCase());
     }
